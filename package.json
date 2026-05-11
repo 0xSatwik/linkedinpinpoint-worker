@@ -1,0 +1,22 @@
+{
+  "name": "linkedin-pinpoint-worker",
+  "version": "1.0.0",
+  "description": "Cloudflare Worker to scrape and store LinkedIn Pinpoint data with D1 database",
+  "main": "src/index.js",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "tail": "wrangler tail"
+  },
+  "keywords": [
+    "cloudflare",
+    "workers",
+    "d1",
+    "linkedin-pinpoint"
+  ],
+  "author": "",
+  "license": "MIT",
+  "devDependencies": {
+    "wrangler": "^3.0.0"
+  }
+}

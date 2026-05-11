@@ -1,0 +1,213 @@
+===============================================
+CLOUDFLARE WORKER & D1 DATABASE COMMANDS
+===============================================
+
+📋 PREREQUISITES
+---------------
+1. Install Node.js (v16 or higher)
+2. Have a Cloudflare account
+3. Install Wrangler CLI globally
+
+
+🔧 INSTALLATION & SETUP
+-----------------------
+
+# Install Wrangler CLI globally
+npm install -g wrangler
+
+# Or install project dependencies (includes wrangler)
+npm install
+
+
+🔐 AUTHENTICATION
+-----------------
+
+# Login to Cloudflare
+wrangler login
+
+# Logout from Cloudflare
+wrangler logout
+
+# Check who is logged in
+wrangler whoami
+
+
+💾 D1 DATABASE COMMANDS
+-----------------------
+
+# Create a new D1 database
+wrangler d1 create pinpoint-database
+
+# IMPORTANT: Copy the database_id from the output and paste it in wrangler.toml
+# It will look like: database_id = "xxxx-xxxx-xxxx-xxxx"
+
+# List all D1 databases
+wrangler d1 list
+
+# Execute SQL commands on the database (create schema)
+wrangler d1 execute pinpoint-database --file=schema.sql
+
+# Or execute SQL directly
+wrangler d1 execute pinpoint-database --command="SELECT * FROM pinpoint_data LIMIT 10"
+
+# View all data in the table
+wrangler d1 execute pinpoint-database --command="SELECT * FROM pinpoint_data"
+
+# Delete all data from table (careful!)
+wrangler d1 execute pinpoint-database --command="DELETE FROM pinpoint_data"
+
+# Drop the entire table (very careful!)
+wrangler d1 execute pinpoint-database --command="DROP TABLE pinpoint_data"
+
+# Delete a D1 database (permanent!)
+wrangler d1 delete pinpoint-database
+
+
+🔑 SECRET MANAGEMENT
+--------------------
+
+# Set the SECRET_KEY environment variable (IMPORTANT!)
+wrangler secret put SECRET_KEY
+# When prompted, enter: BloggingIo@7
+
+# List all secrets (won't show values)
+wrangler secret list
+
+# Delete a secret
+wrangler secret delete SECRET_KEY
+
+
+🚀 DEVELOPMENT & DEPLOYMENT
+---------------------------
+
+# Start local development server
+wrangler dev
+# or
+npm run dev
+
+# Deploy to Cloudflare Workers
+wrangler deploy
+# or
+npm run deploy
+
+# View real-time logs
+wrangler tail
+# or
+npm run tail
+
+# View recent logs
+wrangler tail --format=pretty
+
+# Publish a new version
+wrangler deploy
+
+
+📊 WORKER MANAGEMENT
+--------------------
+
+# List all workers
+wrangler deployments list
+
+# Delete a worker
+wrangler delete linkedin-pinpoint-worker
+
+# View worker details
+wrangler deployments view
+
+# Rollback to previous deployment
+wrangler rollback
+
+
+🧪 TESTING ENDPOINTS
+--------------------
+
+After deployment, you'll get a URL like: https://linkedin-pinpoint-worker.{your-subdomain}.workers.dev
+
+# Test root endpoint (API documentation)
+curl https://linkedin-pinpoint-worker.{your-subdomain}.workers.dev/
+
+# Get today's/latest pinpoint
+curl https://linkedin-pinpoint-worker.{your-subdomain}.workers.dev/today
+
+# Add new pinpoint data (protected - requires secret key)
+curl https://linkedin-pinpoint-worker.{your-subdomain}.workers.dev/add/422/BloggingIo@7
+
+# Delete pinpoint data (protected - requires secret key)
+curl https://linkedin-pinpoint-worker.{your-subdomain}.workers.dev/delete/422/BloggingIo@7
+
+# Search by clue
+curl "https://linkedin-pinpoint-worker.{your-subdomain}.workers.dev/search/clue?q=phones"
+
+# Search by answer
+curl "https://linkedin-pinpoint-worker.{your-subdomain}.workers.dev/search/answer?q=head"
+
+# Get by number
+curl https://linkedin-pinpoint-worker.{your-subdomain}.workers.dev/search/number/458
+
+# Get by date
+curl https://linkedin-pinpoint-worker.{your-subdomain}.workers.dev/search/date/2025-08-01
+
+
+📝 TYPICAL DEPLOYMENT WORKFLOW
+------------------------------
+
+1. Install dependencies:
+   npm install
+
+2. Login to Cloudflare:
+   wrangler login
+
+3. Create D1 database:
+   wrangler d1 create pinpoint-database
+
+4. Copy the database_id to wrangler.toml
+
+5. Initialize database schema:
+   wrangler d1 execute pinpoint-database --file=schema.sql
+
+6. Set secret key:
+   wrangler secret put SECRET_KEY
+   (Enter: BloggingIo@7)
+
+7. Test locally:
+   npm run dev
+
+8. Deploy to production:
+   npm run deploy
+
+9. Test your endpoints with the worker URL
+
+
+🔍 DEBUGGING
+------------
+
+# View worker logs in real-time
+wrangler tail
+
+# Check D1 database contents
+wrangler d1 execute pinpoint-database --command="SELECT COUNT(*) as total FROM pinpoint_data"
+
+# Test local worker
+wrangler dev --local
+
+# Debug with verbose output
+wrangler deploy --verbose
+
+
+⚠️ IMPORTANT NOTES
+------------------
+
+1. SECRET_KEY (BloggingIo@7) is stored securely in Cloudflare and never exposed in code
+2. Always test with 'wrangler dev' before deploying
+3. The /add and /delete endpoints are protected with the secret key
+4. All search endpoints are publicly accessible
+5. Database operations are automatically handled by D1
+6. CORS is enabled for all endpoints
+
+
+📚 USEFUL LINKS
+---------------
+
+- Wrangler Docs: https://developers.cloudflare.com/workers/wrangler/
+- D1 Database: https://developers.cloudflare.com/d1/
+- Workers Dashboard: https://dash.cloudflare.com/
