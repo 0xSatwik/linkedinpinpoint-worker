@@ -20,6 +20,15 @@ const ALLOWED_ORIGINS = [
   'http://localhost:3000'
 ];
 
+// Also allow any Cloudflare Pages deployment subdomain for this project
+function checkAllowedOrigin(origin) {
+  if (!origin) return false;
+  if (ALLOWED_ORIGINS.includes(origin)) return true;
+  // Allow any *.linkedin-pinpoint-answers.pages.dev subdomain
+  if (origin.match(/^https:\/\/[a-z0-9-]+\.linkedin-pinpoint-answers\.pages\.dev$/)) return true;
+  return false;
+}
+
 // Also allow X-API-Key header for server-side rendering
 const API_KEY_HEADER = 'X-API-Key';
 
@@ -80,7 +89,7 @@ export default {
       'Content-Type': 'application/json',
     };
 
-    const isAllowedOrigin = (origin && ALLOWED_ORIGINS.includes(origin)) || isAuthorizedBySecret;
+    const isAllowedOrigin = checkAllowedOrigin(origin) || isAuthorizedBySecret;
 
     if (isAllowedOrigin) {
       corsHeaders['Access-Control-Allow-Origin'] = origin || '*';
