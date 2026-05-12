@@ -2,6 +2,7 @@
  * Cloudflare Worker for LinkedIn Pinpoint Data Scraping and Storage
  * Uses D1 database to store and retrieve pinpoint data
  * Integrates Google Gemini API for generating answer explanations
+ * Scheduled trigger runs daily at 1:31 PM IST (8:01 AM UTC)
  */
 
 // GEMINI_API_KEY should be set via `npx wrangler secret put GEMINI_API_KEY`
@@ -13,89 +14,103 @@ const ALLOWED_ORIGINS = [
   'https://pinpointanswertoday.online',
   'https://www.pinpointanswertoday.online',
   'https://pinpointanswers.vercel.app',
+  'https://linkedin-pinpoint-answers.pages.dev',
+  'https://pinpointanswertoday.online',
   'http://localhost:3001',
   'http://localhost:3000'
 ];
 
+// Also allow X-API-Key header for server-side rendering
+const API_KEY_HEADER = 'X-API-Key';
+
 export default {
+
+  async scheduled(event, env, ctx) {
+    console.log('Scheduled trigger fired at:', new Date().toISOString());
+
+    try {
+      // Get the latest puzzle number from the DB to determine what's next
+      const latest = await env.DB.prepare(
+        'SELECT number FROM pinpoint_data ORDER BY number DESC LIMIT 1'
+      ).first();
+
+      const nextNumber = latest ? latest.number + 1 : 1;
+      console.log(`Attempting to scrape pinpoint #${nextNumber}`);
+
+      const data = await scrapeAndStorePinpoint(env, nextNumber);
+
+      if (data && data.answer) {
+        console.log(`Successfully added pinpoint #${nextNumber}: ${data.answer}`);
+
+        // Trigger frontend rebuild via GitHub Actions
+        ctx.waitUntil(triggerDeploy(env));
+      } else {
+        console.log(`Pinpoint #${nextNumber} not available yet or scraping failed`);
+      }
+    } catch (err) {
+      console.error('Scheduled job error:', err.message);
+    }
+  },
 
   async fetch(request, env) {
     const url = new URL(request.url);
     let path = url.pathname;
     const origin = request.headers.get('Origin');
+    const apiKeyHeader = request.headers.get(API_KEY_HEADER);
 
     // Check for Secret Key Bypass (Browser Access)
-    // Allows accessing protected paths via /path/to/resource/{SECRET_KEY}
     let isAuthorizedBySecret = false;
     const secretKey = env.SECRET_KEY;
 
     if (secretKey && path.endsWith(`/${secretKey}`)) {
       isAuthorizedBySecret = true;
-      // Strip the secret key from the path to allow normal routing
       path = path.substring(0, path.length - (secretKey.length + 1));
-      // Handle edge case where path might be empty after strip (e.g. /secret -> /)
       if (path === '') path = '/';
     }
 
-    // CORS headers - Dynamic based on Origin
+    // Also authorize via X-API-Key header (for SSR)
+    if (apiKeyHeader && apiKeyHeader === secretKey) {
+      isAuthorizedBySecret = true;
+    }
+
+    // CORS headers
     let corsHeaders = {
       'Access-Control-Allow-Methods': 'GET, OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type',
+      'Access-Control-Allow-Headers': 'Content-Type, X-API-Key',
       'Content-Type': 'application/json',
     };
 
     const isAllowedOrigin = (origin && ALLOWED_ORIGINS.includes(origin)) || isAuthorizedBySecret;
 
     if (isAllowedOrigin) {
-      // If authorized by secret (direct browser), allow * or current origin
       corsHeaders['Access-Control-Allow-Origin'] = origin || '*';
       corsHeaders['Vary'] = 'Origin';
-    } else {
-      // For unauthorized origins, we might return * or null, or not set it.
-      // But since we are going to block protected paths anyway, we can set * for public paths
-      // or just leave it strict. Let's set it to null or omit if not allowed.
-      // To prevent 'CORS error' hiding the real 403, it's sometimes better to return * but send 403.
-      // But user wants strict restriction.
-      // If we don't send ACAO, browser blocks it. Logic holds.
     }
 
     // Handle CORS preflight
     if (request.method === 'OPTIONS') {
-      // If origin is allowed, return success
       if (isAllowedOrigin) {
         return new Response(null, { headers: corsHeaders });
       }
-      // If not allowed, we can still return 204 but without ACAO header, which fails CORS check in browser
       return new Response(null, { status: 204 });
     }
 
     // Protected Endpoints List
-    // These endpoints require a valid Origin from the whitelist OR the secret key
     const protectedPrefixes = ['/today', '/yesterday', '/last', '/search'];
     const isProtectedPath = protectedPrefixes.some(prefix => path.startsWith(prefix));
 
     if (isProtectedPath) {
       if (!isAllowedOrigin) {
-        // Direct open (no origin) OR unauthorized origin
         return new Response(JSON.stringify({
           success: false,
           error: 'Forbidden',
           message: 'Protected: Access Denied. Requests allowed only from authorized domains.'
         }), {
           status: 403,
-          headers: {
-            'Content-Type': 'application/json'
-          }
+          headers: { 'Content-Type': 'application/json' }
         });
       }
     } else {
-      // For non-protected paths (like root), allow * if we want them public,
-      // or stick to the strict CORS.
-      // User said "show protected only for these".
-      // So root / is technically public? 
-      // Let's allow * for root if origin is missing/different, to keep API doc visible?
-      // Or just keep the strict logic above. 
-      // If I want root to be visible to everyone:
       if (!corsHeaders['Access-Control-Allow-Origin']) {
         corsHeaders['Access-Control-Allow-Origin'] = '*';
       }
@@ -106,8 +121,8 @@ export default {
       if (path === '/') {
         return new Response(JSON.stringify({
           message: 'LinkedIn Pinpoint API',
-          version: '1.0.0',
-          access: 'Protected Enpoints: /today, /yesterday, /last, /search',
+          version: '2.0.0',
+          access: 'Protected Endpoints: /today, /yesterday, /last, /search',
           endpoints: {
             'GET /': 'API documentation',
             'GET /today': 'Get the latest pinpoint data (Protected)',
@@ -117,10 +132,37 @@ export default {
             'GET /search/answer?q={query}': 'Search by answer text (Protected)',
             'GET /search/number/{number}': 'Get data by pinpoint number (Protected)',
             'GET /search/date/{date}': 'Get data by date (Protected)',
+            'GET /solutions/{number}/{offset}/{limit}': 'Get solutions batch',
+            'GET /check/{number}/{word}': 'Check if word is valid solution',
+            'GET /trigger-deploy': 'Trigger frontend rebuild (Secret Key)',
           }
-        }, null, 2), {
-          headers: corsHeaders,
-        });
+        }, null, 2), { headers: corsHeaders });
+      }
+
+      // GET /trigger-deploy - Trigger GitHub Actions to rebuild frontend
+      if (path === '/trigger-deploy') {
+        if (!isAuthorizedBySecret) {
+          return new Response(JSON.stringify({
+            success: false,
+            error: 'Unauthorized',
+            message: 'Secret key required to trigger deployments'
+          }), { status: 401, headers: corsHeaders });
+        }
+
+        try {
+          const result = await triggerDeploy(env);
+          return new Response(JSON.stringify({
+            success: true,
+            message: 'Deploy triggered successfully',
+            result
+          }), { headers: corsHeaders });
+        } catch (err) {
+          return new Response(JSON.stringify({
+            success: false,
+            error: 'Deploy trigger failed',
+            message: err.message
+          }), { status: 500, headers: corsHeaders });
+        }
       }
 
       // GET /today - Get latest pinpoint data
@@ -134,28 +176,13 @@ export default {
             success: false,
             error: 'No data found',
             message: 'No pinpoint data available yet'
-          }), {
-            status: 404,
-            headers: corsHeaders,
-          });
+          }), { status: 404, headers: corsHeaders });
         }
 
         return new Response(JSON.stringify({
           success: true,
-          data: {
-            number: result.number,
-            date: result.date,
-            clues: JSON.parse(result.clues),
-            answer: result.answer,
-            explanation: result.explanation || null,
-            // OPTIMIZATION: Return only top 10 solutions initially
-            solutions: result.other_solutions ? JSON.parse(result.other_solutions).slice(0, 10) : [],
-            totalSolutions: result.other_solutions ? JSON.parse(result.other_solutions).length : 0,
-            created_at: result.created_at,
-          }
-        }), {
-          headers: corsHeaders,
-        });
+          data: formatPuzzleResult(result)
+        }), { headers: corsHeaders });
       }
 
       // GET /yesterday - Get 2nd latest pinpoint data
@@ -169,71 +196,47 @@ export default {
             success: false,
             error: 'No data found',
             message: 'No yesterday pinpoint data available yet'
-          }), {
-            status: 404,
-            headers: corsHeaders,
-          });
+          }), { status: 404, headers: corsHeaders });
         }
 
         return new Response(JSON.stringify({
           success: true,
-          data: {
-            number: result.number,
-            date: result.date,
-            clues: JSON.parse(result.clues),
-            answer: result.answer,
-            explanation: result.explanation || null,
-            // OPTIMIZATION: Return only top 10 solutions initially
-            solutions: result.other_solutions ? JSON.parse(result.other_solutions).slice(0, 10) : [],
-            totalSolutions: result.other_solutions ? JSON.parse(result.other_solutions).length : 0,
-            created_at: result.created_at,
-          }
-        }), {
-          headers: corsHeaders,
-        });
+          data: formatPuzzleResult(result)
+        }), { headers: corsHeaders });
       }
 
-      // GET /last/{limit}/{page} - Get latest N pinpoints with pagination
+      // GET /last/{limit}/{page}
       const lastMatch = path.match(/^\/last\/(\d+)\/(\d+)$/);
       if (lastMatch) {
         let limit = parseInt(lastMatch[1]);
         const page = parseInt(lastMatch[2]);
 
-        if (limit > 20) limit = 20; // Enforce max 20 limit
+        if (limit > 20) limit = 20;
         if (limit < 1) limit = 1;
         if (page < 1) {
           return new Response(JSON.stringify({
-            success: false,
-            error: 'Invalid parameter',
+            success: false, error: 'Invalid parameter',
             message: 'Page number must be at least 1'
-          }), {
-            status: 400,
-            headers: corsHeaders,
-          });
+          }), { status: 400, headers: corsHeaders });
         }
 
         const offset = (page - 1) * limit;
-
         const results = await env.DB.prepare(
           'SELECT number, date, clues FROM pinpoint_data ORDER BY number DESC LIMIT ? OFFSET ?'
         ).bind(limit, offset).all();
 
         return new Response(JSON.stringify({
-          success: true,
-          limit,
-          page,
+          success: true, limit, page,
           count: results.results.length,
           data: results.results.map(r => ({
             number: r.number,
             date: r.date,
             clues: JSON.parse(r.clues)
           }))
-        }), {
-          headers: corsHeaders,
-        });
+        }), { headers: corsHeaders });
       }
 
-      // 3. GET /solutions/:number/:offset/:limit - Returns batch of solutions
+      // GET /solutions/{number}/{offset}/{limit}
       const solutionsMatch = path.match(/^\/solutions\/(\d+)\/(\d+)\/(\d+)$/);
       if (solutionsMatch) {
         const number = parseInt(solutionsMatch[1]);
@@ -253,19 +256,16 @@ export default {
           const slicedSolutions = allSolutions.slice(offset, offset + limit);
 
           return new Response(JSON.stringify({
-            success: true,
-            data: slicedSolutions,
+            success: true, data: slicedSolutions,
             total: allSolutions.length,
             hasMore: (offset + limit) < allSolutions.length
-          }), {
-            headers: corsHeaders
-          });
+          }), { headers: corsHeaders });
         } catch (e) {
           return new Response(JSON.stringify({ success: false, error: e.message }), { headers: corsHeaders, status: 500 });
         }
       }
 
-      // 9. GET /check/:number/:word - Check if a word is a valid solution for a puzzle
+      // GET /check/{number}/{word}
       const checkMatch = path.match(/^\/check\/(\d+)\/(.+)$/);
       if (checkMatch) {
         const number = parseInt(checkMatch[1]);
@@ -281,38 +281,27 @@ export default {
           }
 
           const allSolutions = dbResult.other_solutions ? JSON.parse(dbResult.other_solutions) : [];
-
-          // Case-insensitive check
           const cleanWord = word.toLowerCase().replace(/[^a-z0-9]/g, '');
           const exists = allSolutions.some(s => s.toLowerCase().replace(/[^a-z0-9]/g, '') === cleanWord);
 
           return new Response(JSON.stringify({
-            success: true,
-            exists: exists,
-            word: word
-          }), {
-            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
-          });
+            success: true, exists, word
+          }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
         } catch (e) {
           return new Response(JSON.stringify({ success: false, error: e.message }), { headers: corsHeaders });
         }
       }
 
-      // GET /add/{number}/{secretkey} - Scrape and add data
+      // GET /add/{number}/{secretkey}
       const addMatch = path.match(/^\/add\/(\d+)(?:\/(.+))?$/);
       if (addMatch) {
         const [, number, providedKey] = addMatch;
 
-        // Verify secret key (either in path or via bypass)
         if (providedKey !== env.SECRET_KEY && !isAuthorizedBySecret) {
           return new Response(JSON.stringify({
-            success: false,
-            error: 'Unauthorized',
+            success: false, error: 'Unauthorized',
             message: 'Invalid or missing secret key'
-          }), {
-            status: 401,
-            headers: corsHeaders,
-          });
+          }), { status: 401, headers: corsHeaders });
         }
 
         try {
@@ -320,50 +309,34 @@ export default {
 
           if (!data || !data.answer) {
             return new Response(JSON.stringify({
-              success: false,
-              error: 'Processing failed',
-              message: 'Could not extract required data',
-              data: data
-            }), {
-              status: 500,
-              headers: corsHeaders,
-            });
+              success: false, error: 'Processing failed',
+              message: 'Could not extract required data', data
+            }), { status: 500, headers: corsHeaders });
           }
 
+          // Trigger frontend rebuild after adding new puzzle
+          ctx.waitUntil(triggerDeploy(env));
+
           return new Response(JSON.stringify({
-            success: true,
-            message: 'Data added/updated successfully',
-            data: data
-          }), {
-            headers: corsHeaders,
-          });
+            success: true, message: 'Data added/updated successfully', data
+          }), { headers: corsHeaders });
         } catch (err) {
           return new Response(JSON.stringify({
-            success: false,
-            error: 'Failed to add',
-            message: err.message
-          }), {
-            status: 500,
-            headers: corsHeaders,
-          });
+            success: false, error: 'Failed to add', message: err.message
+          }), { status: 500, headers: corsHeaders });
         }
       }
 
-      // GET /delete/{number}/{secretkey} - Delete data
+      // GET /delete/{number}/{secretkey}
       const deleteMatch = path.match(/^\/delete\/(\d+)(?:\/(.+))?$/);
       if (deleteMatch) {
         const [, number, providedKey] = deleteMatch;
 
-        // Verify secret key (either in path or via bypass)
         if (providedKey !== env.SECRET_KEY && !isAuthorizedBySecret) {
           return new Response(JSON.stringify({
-            success: false,
-            error: 'Unauthorized',
+            success: false, error: 'Unauthorized',
             message: 'Invalid or missing secret key'
-          }), {
-            status: 401,
-            headers: corsHeaders,
-          });
+          }), { status: 401, headers: corsHeaders });
         }
 
         const result = await env.DB.prepare(
@@ -372,21 +345,14 @@ export default {
 
         if (result.meta.changes === 0) {
           return new Response(JSON.stringify({
-            success: false,
-            error: 'Not found',
+            success: false, error: 'Not found',
             message: `No data found for pinpoint number ${number}`
-          }), {
-            status: 404,
-            headers: corsHeaders,
-          });
+          }), { status: 404, headers: corsHeaders });
         }
 
         return new Response(JSON.stringify({
-          success: true,
-          message: `Pinpoint ${number} deleted successfully`
-        }), {
-          headers: corsHeaders,
-        });
+          success: true, message: `Pinpoint ${number} deleted successfully`
+        }), { headers: corsHeaders });
       }
 
       // GET /search/clue?q={query}
@@ -394,13 +360,9 @@ export default {
         const query = url.searchParams.get('q');
         if (!query) {
           return new Response(JSON.stringify({
-            success: false,
-            error: 'Missing parameter',
+            success: false, error: 'Missing parameter',
             message: 'Query parameter "q" is required'
-          }), {
-            status: 400,
-            headers: corsHeaders,
-          });
+          }), { status: 400, headers: corsHeaders });
         }
 
         const results = await env.DB.prepare(
@@ -408,18 +370,9 @@ export default {
         ).bind(`%${query}%`).all();
 
         return new Response(JSON.stringify({
-          success: true,
-          count: results.results.length,
-          data: results.results.map(r => ({
-            number: r.number,
-            date: r.date,
-            clues: JSON.parse(r.clues),
-            answer: r.answer,
-            explanation: r.explanation || null,
-          }))
-        }), {
-          headers: corsHeaders,
-        });
+          success: true, count: results.results.length,
+          data: results.results.map(r => formatPuzzleResult(r))
+        }), { headers: corsHeaders });
       }
 
       // GET /search/answer?q={query}
@@ -427,13 +380,9 @@ export default {
         const query = url.searchParams.get('q');
         if (!query) {
           return new Response(JSON.stringify({
-            success: false,
-            error: 'Missing parameter',
+            success: false, error: 'Missing parameter',
             message: 'Query parameter "q" is required'
-          }), {
-            status: 400,
-            headers: corsHeaders,
-          });
+          }), { status: 400, headers: corsHeaders });
         }
 
         const results = await env.DB.prepare(
@@ -441,18 +390,9 @@ export default {
         ).bind(`%${query}%`).all();
 
         return new Response(JSON.stringify({
-          success: true,
-          count: results.results.length,
-          data: results.results.map(r => ({
-            number: r.number,
-            date: r.date,
-            clues: JSON.parse(r.clues),
-            answer: r.answer,
-            explanation: r.explanation || null,
-          }))
-        }), {
-          headers: corsHeaders,
-        });
+          success: true, count: results.results.length,
+          data: results.results.map(r => formatPuzzleResult(r))
+        }), { headers: corsHeaders });
       }
 
       // GET /search/number/{number}
@@ -465,30 +405,14 @@ export default {
 
         if (!result) {
           return new Response(JSON.stringify({
-            success: false,
-            error: 'Not found',
+            success: false, error: 'Not found',
             message: `No data found for pinpoint number ${number}`
-          }), {
-            status: 404,
-            headers: corsHeaders,
-          });
+          }), { status: 404, headers: corsHeaders });
         }
 
         return new Response(JSON.stringify({
-          success: true,
-          data: {
-            number: result.number,
-            date: result.date,
-            clues: JSON.parse(result.clues),
-            answer: result.answer,
-            explanation: result.explanation || null,
-            // OPTIMIZATION: Return only top 10 solutions initially
-            solutions: result.other_solutions ? JSON.parse(result.other_solutions).slice(0, 10) : [],
-            totalSolutions: result.other_solutions ? JSON.parse(result.other_solutions).length : 0,
-          }
-        }), {
-          headers: corsHeaders,
-        });
+          success: true, data: formatPuzzleResult(result)
+        }), { headers: corsHeaders });
       }
 
       // GET /search/date/{date}
@@ -501,67 +425,104 @@ export default {
 
         if (!result) {
           return new Response(JSON.stringify({
-            success: false,
-            error: 'Not found',
+            success: false, error: 'Not found',
             message: `No data found for date ${date}`
-          }), {
-            status: 404,
-            headers: corsHeaders,
-          });
+          }), { status: 404, headers: corsHeaders });
         }
 
         return new Response(JSON.stringify({
-          success: true,
-          data: {
-            number: result.number,
-            date: result.date,
-            clues: JSON.parse(result.clues),
-            answer: result.answer,
-            explanation: result.explanation || null,
-            // OPTIMIZATION: Return only top 10 solutions initially
-            solutions: result.other_solutions ? JSON.parse(result.other_solutions).slice(0, 10) : [],
-            totalSolutions: result.other_solutions ? JSON.parse(result.other_solutions).length : 0,
-          }
-        }), {
-          headers: corsHeaders,
-        });
+          success: true, data: formatPuzzleResult(result)
+        }), { headers: corsHeaders });
       }
 
-      // 404 - Not found
+      // 404
       return new Response(JSON.stringify({
-        success: false,
-        error: 'Not found',
+        success: false, error: 'Not found',
         message: 'Endpoint not found',
         availableEndpoints: [
-          'GET /',
-          'GET /today',
+          'GET /', 'GET /today', 'GET /yesterday',
+          'GET /last/{limit}/{page}',
           'GET /add/{number}/{secretkey}',
           'GET /delete/{number}/{secretkey}',
           'GET /search/clue?q={query}',
           'GET /search/answer?q={query}',
           'GET /search/number/{number}',
           'GET /search/date/{date}',
+          'GET /trigger-deploy',
         ]
-      }), {
-        status: 404,
-        headers: corsHeaders,
-      });
+      }), { status: 404, headers: corsHeaders });
 
     } catch (error) {
       return new Response(JSON.stringify({
-        success: false,
-        error: 'Internal server error',
-        message: error.message
-      }), {
-        status: 500,
-        headers: corsHeaders,
-      });
+        success: false, error: 'Internal server error', message: error.message
+      }), { status: 500, headers: corsHeaders });
     }
   },
 };
 
 /**
+ * Format a DB result row into the API response shape
+ */
+function formatPuzzleResult(result) {
+  return {
+    number: result.number,
+    date: result.date,
+    clues: JSON.parse(result.clues),
+    answer: result.answer,
+    explanation: result.explanation || null,
+    solutions: result.other_solutions ? JSON.parse(result.other_solutions) : [],
+    totalSolutions: result.other_solutions ? JSON.parse(result.other_solutions).length : 0,
+    created_at: result.created_at || undefined,
+  };
+}
+
+/**
+ * Trigger GitHub Actions workflow to rebuild and deploy the frontend
+ */
+async function triggerDeploy(env) {
+  const githubToken = env.GITHUB_TOKEN;
+  const frontendRepo = env.FRONTEND_REPO || 'sujitbhai7710/linkedin-pinpoint-frontend';
+
+  if (!githubToken) {
+    console.error('GITHUB_TOKEN not set, skipping deploy trigger');
+    return { triggered: false, reason: 'GITHUB_TOKEN not configured' };
+  }
+
+  console.log(`Triggering deploy for ${frontendRepo}...`);
+
+  const response = await fetch(
+    `https://api.github.com/repos/${frontendRepo}/dispatches`,
+    {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${githubToken}`,
+        'Accept': 'application/vnd.github.v3+json',
+        'Content-Type': 'application/json',
+        'User-Agent': 'linkedin-pinpoint-worker'
+      },
+      body: JSON.stringify({
+        event_type: 'deploy',
+        client_payload: {
+          triggered_by: 'worker-cron',
+          timestamp: new Date().toISOString()
+        }
+      })
+    }
+  );
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    console.error(`GitHub dispatch failed: ${response.status} - ${errorText}`);
+    throw new Error(`GitHub dispatch failed: ${response.status}`);
+  }
+
+  console.log('Deploy triggered successfully');
+  return { triggered: true, repo: frontendRepo };
+}
+
+/**
  * Generate explanation for pinpoint answer using Gemini API
+ * Uses human-style writing: conversational, specific, no corporate jargon
  */
 async function generateExplanation(clues, answer, env) {
   const apiKeyString = env.GEMINI_API_KEY;
@@ -570,7 +531,6 @@ async function generateExplanation(clues, answer, env) {
     return null;
   }
 
-  // Split and trim the keys (supports single key or comma-separated list)
   const apiKeys = apiKeyString.split(',').map(k => k.trim()).filter(k => k.length > 0);
 
   if (apiKeys.length === 0) {
@@ -580,9 +540,18 @@ async function generateExplanation(clues, answer, env) {
 
   console.log(`Starting generation with load balancing across ${apiKeys.length} keys`);
 
-  const prompt = `You are a world-class educational analyst specializing in the LinkedIn Pinpoint game. Your goal is to provide a comprehensive, ultra-detailed, and human-like explanation for today's puzzle. 
+  const prompt = `You're writing for a site called Pinpoint Answer Today, where people come to check the daily LinkedIn Pinpoint answer and actually understand why it's the answer. Write like you're explaining this to a coworker who just asked "hey, what was today's Pinpoint?" over lunch. No corporate speak, no buzzwords, no "revolutionary" or "game-changing" anything.
 
-IMPORTANT: You MUST follow this exact structure. Do not use horizontal rules (*** or ---). Be extremely thorough and write in a normal daily talking way like a real human don't use very hard words for explanations, "article-deep-dive" tone.
+WRITING RULES:
+- Use short, punchy sentences. Mix short and medium ones. Never write a sentence over 25 words unless you absolutely must.
+- Be specific. Don't say "these clues relate to the answer" — say HOW they relate. Use real examples.
+- Active voice, present tense. "The clue points to X" not "X is pointed to by the clue."
+- No hedging. Don't say "this might suggest" — say "this tells you."
+- No transitions like "Let's dive in" or "Without further ado." Just start the next section.
+- End with something useful (a tip, a pattern to watch for), not a summary paragraph.
+- Replace "utilize" with "use", "in order to" with "to", "at this point in time" with "now."
+- Cut "very," "really," "quite," "actually" wherever you find them.
+- If you wouldn't say it in a GitHub issue comment, don't put it in this article.
 
 Clues:
 ${clues.map((clue, i) => `${i + 1}. ${clue}`).join('\n')}
@@ -590,35 +559,35 @@ ${clues.map((clue, i) => `${i + 1}. ${clue}`).join('\n')}
 Answer: ${answer}
 
 ## Deep Clue Analysis
-For each clue, provide a pairing of its just  meaning
+For each clue, give a tight, specific explanation of what it means and how it points to the answer. Use this format:
+
 ### ${clues[0]}
-**The Meaning of the Clue**: [just meaning of it  "${clues[0]}"]
+**What it means**: [plain-English meaning of "${clues[0]}" and how it connects to the answer — be specific, give an example if helpful]
 
 ### ${clues[1]}
-**The Meaning of the Clue**: [just meaning of it  "${clues[1]}"]
+**What it means**: [same thing for "${clues[1]}"]
 
 ### ${clues[2]}
-**The Meaning of the Clue**: [just meaning of it  "${clues[2]}"]
-
+**What it means**: [same thing for "${clues[2]}"]
 
 ### ${clues[3]}
-**The Meaning of the Clue**: [just meaning of it  "${clues[3]}"]
+**What it means**: [same thing for "${clues[3]}"]
 
 ### ${clues[4]}
-**The Meaning of the Clue**: [just meaning of it  "${clues[4]}"]
+**What it means**: [same thing for "${clues[4]}"]
 
-## How we solved it based on the clues 
-write in details how you solved it based on the clues i mean assume yourself as a expert solver and you are soving you got first clue what you though then you got may be wrong answer after submitting and you see the 2nd clue and assume another answer this way explain it and at last you guess the correct answer based on all the clues . and make sure to write in multiple small paragraphs not in sigle big paragraph 
+## How We Solved It
+Walk through the solving process like a real person playing the game. You saw clue 1, what did you think? Maybe you guessed wrong. Then clue 2 appeared, and that changed things. Keep going until all 5 clues lock in the answer. Write in multiple short paragraphs (2-3 sentences each), not one giant block.
 
+## Lessons Learned
+Give 3-4 specific, actionable takeaways from this puzzle that help with future Pinpoint puzzles. No generic advice like "think laterally" — give real patterns to watch for.
 
-## Lessons Learned from this pinpoint
-provide 3-4 pointwise lessons that one learnt and how it can be applied for future puzzles
 ## Frequently Asked Questions
-Provide 4-5 high-quality questions like faqs based on the whole this pinpoint puzzle Format exactly as:
-**Q: [In-depth Question]**
-**A: [Comprehensive, informative Answer]**
+4-5 questions a real player would ask about this specific puzzle. Format:
+**Q: [Specific, in-depth question]**
+**A: [Direct, informative answer — no fluff]**
 
-Maintain a premium, expert tone throughout. Ensure every section is fully populated and detailed.`;
+Remember: you're a knowledgeable peer, not a teacher. The reader plays this game too — they just need the explanation to click.`;
 
   const requestBody = {
     contents: [{
@@ -634,7 +603,6 @@ Maintain a premium, expert tone throughout. Ensure every section is fully popula
 
   let lastError = null;
 
-  // Try each API key until one works
   for (let i = 0; i < apiKeys.length; i++) {
     const apiKey = apiKeys[i];
     const keyHint = apiKey.substring(0, 4) + '...' + apiKey.substring(apiKey.length - 4);
@@ -646,9 +614,7 @@ Maintain a premium, expert tone throughout. Ensure every section is fully popula
         `${GEMINI_API_URL}/${GEMINI_MODEL}:generateContent?key=${apiKey}`,
         {
           method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-          },
+          headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(requestBody)
         }
       );
@@ -658,13 +624,10 @@ Maintain a premium, expert tone throughout. Ensure every section is fully popula
         console.error(`Gemini API error for key ${keyHint}: ${response.status} - ${errorText}`);
         lastError = new Error(`Gemini API error: ${response.status} - ${errorText}`);
 
-        // If it's a rate limit (429) or server error (5xx), try the next key
         if (response.status === 429 || (response.status >= 500 && response.status < 600)) {
-          console.warn(`Key ${keyHint} might be rate-limited or unstable, trying next key...`);
+          console.warn(`Key ${keyHint} rate-limited or unstable, trying next...`);
           continue;
         } else {
-          // For other errors (401, 400), don't bother retrying if it's the only key or if we've tried all
-          // actually, let's keep trying other keys just in case one is valid and others aren't
           continue;
         }
       }
@@ -685,7 +648,6 @@ Maintain a premium, expert tone throughout. Ensure every section is fully popula
     }
   }
 
-  // If we get here, all keys failed
   console.error('All Gemini API keys failed.');
   throw lastError || new Error('All Gemini API keys failed to generate a response.');
 }
@@ -694,9 +656,6 @@ Maintain a premium, expert tone throughout. Ensure every section is fully popula
  * Helper to scrape and store pinpoint data
  */
 async function scrapeAndStorePinpoint(env, number) {
-  // Scrape data from pinpointanswer.today
-
-  // Add timestamp and headers to bust cache
   const scrapeUrl = `https://pinpointanswer.today/linkedin-pinpoint-answer/pinpoint-${number}/?t=${Date.now()}`;
   console.log(`Scraping URL: ${scrapeUrl}`);
 
@@ -712,13 +671,11 @@ async function scrapeAndStorePinpoint(env, number) {
   }
 
   const html = await response.text();
-
-  // Extract data from HTML
   const data = extractPinpointData(html, number);
 
   if (!data.clues || !data.answer || !data.date) {
     console.log('Incomplete data extracted:', data);
-    return data; // Return partial data, caller handles error
+    return data;
   }
 
   // Generate explanation using Gemini API
@@ -759,7 +716,7 @@ async function scrapeAndStorePinpoint(env, number) {
 }
 
 /**
- * Decode HTML entities (e.g., &#x27; to ')
+ * Decode HTML entities
  */
 function decodeHTMLEntities(text) {
   const entities = {
@@ -791,13 +748,11 @@ function extractPinpointData(html, number) {
   };
 
   try {
-    // Extract date from meta tag or time element
     const dateMatch = html.match(/<time[^>]*datetime="([^"]+)"/i);
     if (dateMatch) {
-      data.date = dateMatch[1].split('T')[0]; // Get YYYY-MM-DD part
+      data.date = dateMatch[1].split('T')[0];
     }
 
-    // Extract clues from data-clue-card elements
     const clueRegex = /<div[^>]*data-clue-card="true"[^>]*>[\s\S]*?<div[^>]*>([^<]+)<\/div>\s*<\/div>/g;
     let match;
     const clues = [];
@@ -809,9 +764,7 @@ function extractPinpointData(html, number) {
       }
     }
 
-    // If regex didn't work, try alternative method
     if (clues.length === 0) {
-      // Look for clues in a different pattern
       const altClueRegex = /<div[^>]*class="[^"]*cursor-pointer[^"]*"[^>]*>[\s\S]*?<\/div>\s*<div[^>]*>([^<]+)<\/div>/g;
       while ((match = altClueRegex.exec(html)) !== null) {
         const clueText = match[1].trim();
@@ -821,46 +774,35 @@ function extractPinpointData(html, number) {
       }
     }
 
-    // Decode HTML entities in clues (e.g., &#x27; to ')
     data.clues = clues.map(clue => decodeHTMLEntities(clue));
 
-    // Extract answer from Next.js JSON data in script tags
-    // The answer appears as \\"answer\\":\\"Words that come after 'head'\\",\\"pageData\\" in the React component data
-    // The key is to stop at \\" followed by a comma
-
-    // Pattern 1: Match until \\" followed by comma (the pageData boundary)
-    // This captures: \\"answer\\":\\"ANSWER_TEXT\\",
     let answerMatch = html.match(/\\"answer\\":\\"([^]*?)\\",/);
 
-    // Pattern 2: Try without the comma boundary in case structure differs
     if (!answerMatch || !answerMatch[1] || answerMatch[1].length < 2) {
       answerMatch = html.match(/\\"answer\\":\\"((?:[^"\\]|\\.)*)\\"/);
     }
 
-    // Pattern 3: Try unescaped JSON pattern  
     if (!answerMatch || !answerMatch[1] || answerMatch[1].length < 2) {
       answerMatch = html.match(/"answer"\s*:\s*"([^"]+)"/);
     }
 
-    // Pattern 4: Try HTML patterns as fallback
     if (!answerMatch || !answerMatch[1] || answerMatch[1].length < 2) {
       answerMatch = html.match(/LinkedIn Pinpoint \d+ Answer[^:]*:\s*([^<]{3,100})/i);
     }
 
     if (answerMatch && answerMatch[1]) {
       data.answer = answerMatch[1].trim()
-        .replace(/\\'/g, "'")     // Unescape single quotes
-        .replace(/\\"/g, '"')     // Unescape double quotes
-        .replace(/\\\\/g, '\\')   // Unescape backslashes
-        .replace(/\\n/g, ' ')     // Replace newlines with spaces
-        .replace(/\\r/g, '')      // Remove carriage returns
-        .replace(/\\t/g, ' ')     // Replace tabs with spaces
-        .replace(/\\f/g, '')      // Remove form feeds
-        .replace(/\\b/g, '')      // Remove backspaces
-        .replace(/\\u([0-9a-fA-F]{4})/g, (match, hex) => String.fromCharCode(parseInt(hex, 16))) // Unicode escapes
-        .substring(0, 300);       // Safety limit to 300 chars
+        .replace(/\\'/g, "'")
+        .replace(/\\"/g, '"')
+        .replace(/\\\\/g, '\\')
+        .replace(/\\n/g, ' ')
+        .replace(/\\r/g, '')
+        .replace(/\\t/g, ' ')
+        .replace(/\\f/g, '')
+        .replace(/\\b/g, '')
+        .replace(/\\u([0-9a-fA-F]{4})/g, (match, hex) => String.fromCharCode(parseInt(hex, 16)))
+        .substring(0, 300);
 
-      // Decode any HTML entities in the answer as well
       data.answer = decodeHTMLEntities(data.answer);
     }
 

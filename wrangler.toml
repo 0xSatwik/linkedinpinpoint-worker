@@ -4,11 +4,17 @@ compatibility_date = "2024-12-28"
 
 # D1 Database binding
 [[d1_databases]]
-binding = "DB" # Available in your worker as env.DB
+binding = "DB"
 database_name = "pinpoint-database"
-database_id = "3037e22c-1f89-453c-8b5c-c84af52db65c" # Will be filled after creating the database
+database_id = "3037e22c-1f89-453c-8b5c-c84af52db65c"
 
-# Environment variables (secrets)
+# Scheduled trigger: 1:31 PM IST = 8:01 AM UTC
+[triggers]
+crons = ["1 8 * * *"]
+
+# Environment variables (secrets set via wrangler secret put)
 [vars]
-# SECRET_KEY will be set via wrangler secret put command
-# Do NOT put the actual secret key here
+# SECRET_KEY - set via: npx wrangler secret put SECRET_KEY
+# GEMINI_API_KEY - set via: npx wrangler secret put GEMINI_API_KEY
+# GITHUB_TOKEN - set via: npx wrangler secret put GITHUB_TOKEN
+# FRONTEND_REPO - set via: npx wrangler secret put FRONTEND_REPO (optional, defaults to sujitbhai7710/linkedin-pinpoint-frontend)
