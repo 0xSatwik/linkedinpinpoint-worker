@@ -702,23 +702,56 @@ async function scrapeAndStorePinpoint(env, number) {
     throw new Error(`Gemini API error: ${err.message}. Failed to add to database.`);
   }
 
+  // Generate other_solutions if not already extracted from the source page
+  let otherSolutions = data.other_solutions || [];
+  if (otherSolutions.length === 0) {
+    // Try competitor site first
+    console.log('No solutions found in source page, trying competitor site...');
+    try {
+      const competitorSolutions = await extractSolutionsFromCompetitor(number);
+      if (competitorSolutions.length > 0) {
+        otherSolutions = competitorSolutions;
+      }
+    } catch (err) {
+      console.error('Competitor site extraction failed:', err.message);
+    }
+  }
+
+  if (otherSolutions.length === 0) {
+    // Fallback: use Gemini to generate alternative valid solutions
+    console.log('No solutions from external sources, generating via Gemini API...');
+    try {
+      const generatedSolutions = await generateSolutions(data.clues, data.answer, env);
+      if (generatedSolutions.length > 0) {
+        otherSolutions = generatedSolutions;
+        console.log(`Generated ${generatedSolutions.length} solutions via Gemini`);
+      }
+    } catch (err) {
+      console.error('Solution generation failed:', err.message);
+    }
+  }
+
+  data.other_solutions = otherSolutions;
+
   // Store in database (upsert)
   await env.DB.prepare(`
-    INSERT INTO pinpoint_data (number, date, clues, answer, explanation, updated_at)
-    VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+    INSERT INTO pinpoint_data (number, date, clues, answer, explanation, other_solutions, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
     ON CONFLICT(number) 
     DO UPDATE SET 
       date = excluded.date,
       clues = excluded.clues,
       answer = excluded.answer,
       explanation = excluded.explanation,
+      other_solutions = excluded.other_solutions,
       updated_at = CURRENT_TIMESTAMP
   `).bind(
     parseInt(number),
     data.date,
     JSON.stringify(data.clues),
     data.answer,
-    explanation
+    explanation,
+    otherSolutions.length > 0 ? JSON.stringify(otherSolutions) : null
   ).run();
 
   return data;
@@ -753,7 +786,8 @@ function extractPinpointData(html, number) {
     number: parseInt(number),
     clues: [],
     answer: '',
-    date: ''
+    date: '',
+    other_solutions: []
   };
 
   try {
@@ -815,9 +849,289 @@ function extractPinpointData(html, number) {
       data.answer = decodeHTMLEntities(data.answer);
     }
 
+    // Extract other_solutions from RSC flight data
+    const solutions = extractSolutionsFromRSC(html);
+    if (solutions.length > 0) {
+      data.other_solutions = solutions;
+      console.log(`Extracted ${solutions.length} other_solutions from RSC data`);
+    }
+
   } catch (error) {
     console.error('Error extracting data:', error);
   }
 
   return data;
+}
+
+/**
+ * Extract other_solutions from Next.js RSC flight data in HTML
+ * Looks for patterns in self.__next_f.push calls
+ */
+function extractSolutionsFromRSC(html) {
+  const solutions = [];
+
+  try {
+    // Strategy 1: Look for "other_solutions" or "otherSolutions" key in RSC data
+    // Pattern: "other_solutions":["word1","word2",...] or "otherSolutions":["word1","word2",...]
+    const otherSolutionsPatterns = [
+      /\\"other_solutions\\":\s*\\\[([^\]]*?)\\\]/g,
+      /\\"otherSolutions\\":\s*\\\[([^\]]*?)\\\]/g,
+      /"other_solutions"\s*:\s*\[([^\]]*?)\]/g,
+      /"otherSolutions"\s*:\s*\[([^\]]*?)\]/g,
+    ];
+
+    for (const pattern of otherSolutionsPatterns) {
+      let match;
+      while ((match = pattern.exec(html)) !== null) {
+        try {
+          const rawArray = '[' + match[1]
+            .replace(/\\"/g, '"')
+            .replace(/\\\\/g, '\\') + ']';
+          const parsed = JSON.parse(rawArray);
+          if (Array.isArray(parsed) && parsed.length > 0 && typeof parsed[0] === 'string') {
+            solutions.push(...parsed);
+          }
+        } catch (e) {
+          // Parse failed, try next
+        }
+      }
+      if (solutions.length > 0) break;
+    }
+
+    if (solutions.length > 0) return solutions;
+
+    // Strategy 2: Look for large escaped JSON arrays after the answer field
+    // In RSC data, solutions often appear as a large array right after the answer
+    const answerEscaped = html.match(/\\"answer\\":\\"((?:[^"\\]|\\.)*)\\"/);
+    if (answerEscaped) {
+      const afterAnswerIdx = html.indexOf(answerEscaped[0]) + answerEscaped[0].length;
+      const afterAnswerSection = html.substring(afterAnswerIdx, afterAnswerIdx + 50000);
+
+      // Look for the next large escaped JSON array (100+ items is typical for solutions)
+      const largeArrayMatch = afterAnswerSection.match(/\\\[((?:\\"[^\"]*\\"\s*,?\s*){20,})\\\]/);
+      if (largeArrayMatch) {
+        try {
+          const rawArray = '[' + largeArrayMatch[1]
+            .replace(/\\"/g, '"')
+            .replace(/\\\\/g, '\\') + ']';
+          const parsed = JSON.parse(rawArray);
+          if (Array.isArray(parsed) && parsed.length >= 20 && typeof parsed[0] === 'string') {
+            // Validate: these should be reasonable-length words/phrases, not code identifiers
+            const validEntries = parsed.filter(s => typeof s === 'string' && s.length > 1 && s.length < 100 && !s.startsWith('static/'));
+            if (validEntries.length >= 20) {
+              solutions.push(...validEntries);
+            }
+          }
+        } catch (e) {
+          // Parse failed
+        }
+      }
+    }
+
+    if (solutions.length > 0) return solutions;
+
+    // Strategy 3: Look for "solutions" key in RSC data that contains an array
+    const solutionsKeyPatterns = [
+      /\\"solutions\\":\s*\\\[([^\]]*?)\\\]/g,
+      /"solutions"\s*:\s*\[([^\]]*?)\]/g,
+    ];
+
+    for (const pattern of solutionsKeyPatterns) {
+      let match;
+      while ((match = pattern.exec(html)) !== null) {
+        try {
+          const rawArray = '[' + match[1]
+            .replace(/\\"/g, '"')
+            .replace(/\\\\/g, '\\') + ']';
+          const parsed = JSON.parse(rawArray);
+          if (Array.isArray(parsed) && parsed.length > 0 && typeof parsed[0] === 'string' && parsed.length >= 5) {
+            const validEntries = parsed.filter(s => typeof s === 'string' && s.length > 1 && s.length < 100 && !s.startsWith('static/'));
+            if (validEntries.length >= 5) {
+              solutions.push(...validEntries);
+            }
+          }
+        } catch (e) {
+          // Parse failed
+        }
+      }
+      if (solutions.length > 0) break;
+    }
+
+  } catch (error) {
+    console.error('Error extracting solutions from RSC:', error);
+  }
+
+  return solutions;
+}
+
+/**
+ * Extract solutions from competitor page (linkedinpinpointanswer.today)
+ * The competitor site may show solutions as tag chips on the page
+ */
+async function extractSolutionsFromCompetitor(number) {
+  const competitorUrl = `https://www.linkedinpinpointanswer.today/linkedin-pinpoint-answer/pinpoint-${number}/`;
+  console.log(`Trying competitor site for solutions: ${competitorUrl}`);
+
+  try {
+    const response = await fetch(competitorUrl, {
+      headers: {
+        'Cache-Control': 'no-cache',
+        'Pragma': 'no-cache'
+      }
+    });
+
+    if (!response.ok) {
+      console.log(`Competitor site returned ${response.status}`);
+      return [];
+    }
+
+    const html = await response.text();
+
+    // First, try extracting from RSC data (same as source page)
+    const rscSolutions = extractSolutionsFromRSC(html);
+    if (rscSolutions.length > 0) {
+      console.log(`Found ${rscSolutions.length} solutions from competitor RSC data`);
+      return rscSolutions;
+    }
+
+    // Look for tag chips / word tags that represent solutions
+    // Competitor sites often show solutions as clickable tags or pills
+    const solutions = [];
+
+    // Pattern 1: Elements with class containing 'tag', 'chip', 'pill', or 'badge'
+    const tagPatterns = [
+      /<[^>]*class="[^"]*(?:tag|chip|pill|badge|solution)[^"]*"[^>]*>([^<]+)<\/[^>]+>/gi,
+      /<span[^>]*class="[^"]*inline[^"]*"[^>]*>([^<]{2,50})<\/span>/gi,
+    ];
+
+    for (const pattern of tagPatterns) {
+      let match;
+      while ((match = pattern.exec(html)) !== null) {
+        const text = match[1].trim();
+        if (text && text.length > 1 && text.length < 100 && !text.match(/^[#\d<]/)) {
+          solutions.push(decodeHTMLEntities(text));
+        }
+      }
+    }
+
+    if (solutions.length >= 10) {
+      console.log(`Found ${solutions.length} solution tags from competitor site`);
+      return solutions;
+    }
+
+    console.log(`No significant solutions found on competitor site (found ${solutions.length} tags)`);
+    return [];
+  } catch (error) {
+    console.error('Error fetching competitor site:', error.message);
+    return [];
+  }
+}
+
+/**
+ * Generate alternative valid solutions using Gemini API
+ * Asks Gemini to produce all valid category answers the game would accept
+ */
+async function generateSolutions(clues, answer, env) {
+  const apiKeyString = env.GEMINI_API_KEY;
+  if (!apiKeyString) {
+    console.log('GEMINI_API_KEY not set, skipping solution generation');
+    return [];
+  }
+
+  const apiKeys = apiKeyString.split(',').map(k => k.trim()).filter(k => k.length > 0);
+  if (apiKeys.length === 0) return [];
+
+  const prompt = `You are an expert at the LinkedIn Pinpoint game. In this game, players see 5 clues and must guess the category that connects all clues. The game accepts multiple valid category names as correct answers.
+
+Clues: ${clues.join(', ')}
+Official Answer: ${answer}
+
+Generate a comprehensive JSON array of ALL valid alternative category answers that the LinkedIn Pinpoint game would accept for this puzzle. Include:
+1. Variations of the official answer (singular/plural, synonyms, rephrasings)
+2. Broader categories that still accurately describe all clues
+3. More specific subcategories if applicable
+4. Common ways people would naturally phrase this category
+
+Rules:
+- Each entry must be a string that accurately describes ALL 5 clues
+- Include the official answer itself as the first element
+- Entries should be 2-80 characters long
+- Generate at least 30 entries, aim for 50-100
+- Return ONLY a valid JSON array of strings, no other text
+- Do not include entries that only describe some clues
+- Sort by most likely to be accepted by the game (closest to official answer first)
+
+Example output format:
+["Things found in a chemistry laboratory","Laboratory equipment","Chemistry lab items","Lab supplies",...]`;
+
+  const requestBody = {
+    contents: [{
+      parts: [{ text: prompt }]
+    }],
+    generationConfig: {
+      temperature: 0.3,
+      topK: 20,
+      topP: 0.8,
+      maxOutputTokens: 4096,
+    }
+  };
+
+  let lastError = null;
+
+  for (let i = 0; i < apiKeys.length; i++) {
+    const apiKey = apiKeys[i];
+    const keyHint = apiKey.substring(0, 4) + '...' + apiKey.substring(apiKey.length - 4);
+
+    try {
+      const response = await fetch(
+        `${GEMINI_API_URL}/${GEMINI_MODEL}:generateContent?key=${apiKey}`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(requestBody)
+        }
+      );
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        console.error(`Gemini API error for solutions (key ${keyHint}): ${response.status}`);
+        lastError = new Error(`Gemini API error: ${response.status}`);
+        if (response.status === 429 || (response.status >= 500 && response.status < 600)) {
+          continue;
+        } else {
+          continue;
+        }
+      }
+
+      const result = await response.json();
+
+      if (result.candidates && result.candidates[0] && result.candidates[0].content) {
+        const text = result.candidates[0].content.parts[0].text;
+        // Extract JSON array from the response
+        const jsonMatch = text.match(/\[([\s\S]*)\]/);
+        if (jsonMatch) {
+          try {
+            const parsed = JSON.parse('[' + jsonMatch[1] + ']');
+            if (Array.isArray(parsed) && parsed.length > 0 && typeof parsed[0] === 'string') {
+              // Filter and clean entries
+              const validSolutions = parsed
+                .filter(s => typeof s === 'string' && s.length > 1 && s.length < 200)
+                .map(s => s.trim());
+              console.log(`Generated ${validSolutions.length} solutions using key ${keyHint}`);
+              return validSolutions;
+            }
+          } catch (parseErr) {
+            console.error('Failed to parse solutions JSON:', parseErr.message);
+          }
+        }
+        lastError = new Error('Could not extract JSON array from Gemini response');
+      }
+    } catch (error) {
+      console.error(`Fetch error for solutions (key ${keyHint}):`, error.message);
+      lastError = error;
+    }
+  }
+
+  console.error('All Gemini API keys failed for solution generation:', lastError?.message);
+  return [];
 }
