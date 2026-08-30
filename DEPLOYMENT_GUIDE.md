@@ -1,7 +1,8 @@
 # Deployment Instructions for Gemini API Integration
 
 ## Prerequisites
-- You must have the Gemini API key: AIzaSyBhzHOlrufD879-cVV4R8w03o70zbZmNvA
+- You must have a Gemini API key (generate one at https://aistudio.google.com/app/apikey).
+  Never commit it to the repo — store it as a Cloudflare secret (see Step 2).
 - Wrangler CLI must be installed and authenticated
 
 ## Step 1: Run Database Migration
@@ -21,7 +22,7 @@ Add the Gemini API key as a secret:
 
 ```bash
 npx wrangler secret put GEMINI_API_KEY
-# When prompted, paste: AIzaSyBhzHOlrufD879-cVV4R8w03o70zbZmNvA
+# When prompted, paste YOUR-OWN-Gemini-API-key (not the one previously shown here, which has been rotated)
 ```
 
 ## Step 3: Deploy the Worker
